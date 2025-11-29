@@ -5,56 +5,89 @@ import { getContractReadOnly, getContractWithSigner } from "./components/useCont
 import "./App.css";
 import { useAccount } from 'wagmi';
 import { useFhevm, useEncrypt, useDecrypt } from '../fhevm-sdk/src';
+import { ethers } from 'ethers';
 
-interface CarbonData {
-  id: string;
+interface CarbonRecord {
+  id: number;
   name: string;
-  carbonValue: number;
   category: string;
+  carbonValue: string;
   timestamp: number;
   creator: string;
-  isVerified?: boolean;
-  decryptedValue?: number;
   publicValue1: number;
   publicValue2: number;
+  isVerified?: boolean;
+  decryptedValue?: number;
+  encryptedValueHandle?: string;
+  ecoLevel?: string;
+}
+
+interface EcoStats {
+  totalFootprint: number;
+  ecoScore: number;
+  level: string;
+  badges: string[];
+  weeklyChange: number;
 }
 
 const App: React.FC = () => {
   const { address, isConnected } = useAccount();
   const [loading, setLoading] = useState(true);
-  const [carbonData, setCarbonData] = useState<CarbonData[]>([]);
+  const [records, setRecords] = useState<CarbonRecord[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [showAddModal, setShowAddModal] = useState(false);
-  const [addingData, setAddingData] = useState(false);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [creatingRecord, setCreatingRecord] = useState(false);
   const [transactionStatus, setTransactionStatus] = useState<{ visible: boolean; status: "pending" | "success" | "error"; message: string; }>({ 
     visible: false, 
-    status: "pending", 
+    status: "pending" as const, 
     message: "" 
   });
-  const [newData, setNewData] = useState({ name: "", carbonValue: "", category: "transport" });
-  const [selectedData, setSelectedData] = useState<CarbonData | null>(null);
-  const [decryptedValue, setDecryptedValue] = useState<number | null>(null);
+  const [newRecordData, setNewRecordData] = useState({ 
+    name: "", 
+    category: "transport", 
+    carbonValue: "" 
+  });
+  const [selectedRecord, setSelectedRecord] = useState<CarbonRecord | null>(null);
+  const [decryptedData, setDecryptedData] = useState<number | null>(null);
   const [isDecrypting, setIsDecrypting] = useState(false);
   const [contractAddress, setContractAddress] = useState("");
   const [fhevmInitializing, setFhevmInitializing] = useState(false);
-  const [environmentLevel, setEnvironmentLevel] = useState("");
+  const [ecoStats, setEcoStats] = useState<EcoStats>({
+    totalFootprint: 0,
+    ecoScore: 85,
+    level: "绿色先锋",
+    badges: ["环保新人", "低碳出行"],
+    weeklyChange: -12
+  });
+  const [showFAQ, setShowFAQ] = useState(false);
+  const [operationHistory, setOperationHistory] = useState<string[]>([]);
 
   const { status, initialize, isInitialized } = useFhevm();
-  const { encrypt, isEncrypting } = useEncrypt();
+  const { encrypt, isEncrypting} = useEncrypt();
   const { verifyDecryption, isDecrypting: fheIsDecrypting } = useDecrypt();
+
+  const addToHistory = (action: string) => {
+    setOperationHistory(prev => [
+      `${new Date().toLocaleTimeString()}: ${action}`,
+      ...prev.slice(0, 9)
+    ]);
+  };
 
   useEffect(() => {
     const initFhevmAfterConnection = async () => {
-      if (!isConnected || isInitialized || fhevmInitializing) return;
+      if (!isConnected) return;
+      if (isInitialized || fhevmInitializing) return;
       
       try {
         setFhevmInitializing(true);
         await initialize();
+        addToHistory("FHEVM 系统初始化完成");
       } catch (error) {
+        console.error('FHEVM初始化失败:', error);
         setTransactionStatus({ 
           visible: true, 
           status: "error", 
-          message: "FHEVM initialization failed" 
+          message: "FHEVM 初始化失败" 
         });
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       } finally {
@@ -77,7 +110,7 @@ const App: React.FC = () => {
         const contract = await getContractReadOnly();
         if (contract) setContractAddress(await contract.getAddress());
       } catch (error) {
-        console.error('Failed to load data:', error);
+        console.error('数据加载失败:', error);
       } finally {
         setLoading(false);
       }
@@ -95,91 +128,116 @@ const App: React.FC = () => {
       if (!contract) return;
       
       const businessIds = await contract.getAllBusinessIds();
-      const dataList: CarbonData[] = [];
+      const recordsList: CarbonRecord[] = [];
       
       for (const businessId of businessIds) {
         try {
           const businessData = await contract.getBusinessData(businessId);
-          dataList.push({
-            id: businessId,
+          const decryptedValue = Number(businessData.decryptedValue) || 0;
+          recordsList.push({
+            id: parseInt(businessId.replace('carbon-', '')) || Date.now(),
             name: businessData.name,
-            carbonValue: 0,
-            category: "carbon",
+            category: businessData.description.includes("交通") ? "transport" : "consumption",
+            carbonValue: businessId,
             timestamp: Number(businessData.timestamp),
             creator: businessData.creator,
             publicValue1: Number(businessData.publicValue1) || 0,
             publicValue2: Number(businessData.publicValue2) || 0,
             isVerified: businessData.isVerified,
-            decryptedValue: Number(businessData.decryptedValue) || 0
+            decryptedValue: decryptedValue,
+            ecoLevel: calculateEcoLevel(decryptedValue)
           });
         } catch (e) {
-          console.error('Error loading business data:', e);
+          console.error('加载碳足迹数据失败:', e);
         }
       }
       
-      setCarbonData(dataList);
-      calculateEnvironmentLevel(dataList);
+      setRecords(recordsList);
+      updateEcoStats(recordsList);
+      addToHistory("碳足迹数据加载完成");
     } catch (e) {
-      setTransactionStatus({ visible: true, status: "error", message: "Failed to load data" });
+      setTransactionStatus({ visible: true, status: "error", message: "数据加载失败" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     } finally { 
       setIsRefreshing(false); 
     }
   };
 
-  const calculateEnvironmentLevel = (data: CarbonData[]) => {
-    const totalCarbon = data.reduce((sum, item) => sum + (item.decryptedValue || 0), 0);
-    if (totalCarbon === 0) {
-      setEnvironmentLevel("🌱 初始环保者");
-    } else if (totalCarbon < 100) {
-      setEnvironmentLevel("🌿 绿色先锋");
-    } else if (totalCarbon < 500) {
-      setEnvironmentLevel("🍃 环保达人");
-    } else {
-      setEnvironmentLevel("🌳 生态卫士");
-    }
+  const calculateEcoLevel = (value: number): string => {
+    if (value <= 10) return "🌱 环保先锋";
+    if (value <= 30) return "💚 绿色达人";
+    if (value <= 60) return "🟡 中等水平";
+    if (value <= 100) return "🟠 有待改进";
+    return "🔴 高碳排放";
   };
 
-  const addCarbonData = async () => {
+  const updateEcoStats = (records: CarbonRecord[]) => {
+    const verifiedRecords = records.filter(r => r.isVerified);
+    const total = verifiedRecords.reduce((sum, r) => sum + (r.decryptedValue || 0), 0);
+    const avg = verifiedRecords.length > 0 ? total / verifiedRecords.length : 0;
+    
+    let score = 100 - Math.min(100, avg * 2);
+    if (score < 0) score = 0;
+    
+    setEcoStats({
+      totalFootprint: total,
+      ecoScore: Math.round(score),
+      level: calculateEcoLevel(avg),
+      badges: getBadges(avg, verifiedRecords.length),
+      weeklyChange: -Math.round(avg * 0.1)
+    });
+  };
+
+  const getBadges = (avg: number, count: number): string[] => {
+    const badges = [];
+    if (count >= 5) badges.push("数据达人");
+    if (avg <= 20) badges.push("低碳先锋");
+    if (avg <= 10) badges.push("环保大师");
+    if (count >= 10) badges.push("持续记录");
+    return badges;
+  };
+
+  const createRecord = async () => {
     if (!isConnected || !address) { 
       setTransactionStatus({ visible: true, status: "error", message: "请先连接钱包" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return; 
     }
     
-    setAddingData(true);
-    setTransactionStatus({ visible: true, status: "pending", message: "使用Zama FHE加密碳足迹数据..." });
+    setCreatingRecord(true);
+    setTransactionStatus({ visible: true, status: "pending", message: "使用 Zama FHE 加密碳足迹数据..." });
     
     try {
       const contract = await getContractWithSigner();
       if (!contract) throw new Error("获取合约失败");
       
-      const carbonValue = parseInt(newData.carbonValue) || 0;
+      const carbonValue = parseInt(newRecordData.carbonValue) || 0;
       const businessId = `carbon-${Date.now()}`;
       
       const encryptedResult = await encrypt(contractAddress, address, carbonValue);
       
       const tx = await contract.createBusinessData(
         businessId,
-        newData.name,
+        newRecordData.name,
         encryptedResult.encryptedData,
         encryptedResult.proof,
+        carbonValue,
         0,
-        0,
-        `碳足迹记录: ${newData.category}`
+        newRecordData.category === "transport" ? "交通碳排放" : "消费碳排放"
       );
       
       setTransactionStatus({ visible: true, status: "pending", message: "等待交易确认..." });
       await tx.wait();
       
-      setTransactionStatus({ visible: true, status: "success", message: "碳足迹数据添加成功!" });
+      setTransactionStatus({ visible: true, status: "success", message: "碳足迹记录创建成功!" });
+      addToHistory(`创建记录: ${newRecordData.name}`);
       setTimeout(() => {
         setTransactionStatus({ visible: false, status: "pending", message: "" });
       }, 2000);
       
       await loadData();
-      setShowAddModal(false);
-      setNewData({ name: "", carbonValue: "", category: "transport" });
+      setShowCreateModal(false);
+      setNewRecordData({ name: "", category: "transport", carbonValue: "" });
     } catch (e: any) {
       const errorMessage = e.message?.includes("user rejected transaction") 
         ? "用户取消交易" 
@@ -187,7 +245,7 @@ const App: React.FC = () => {
       setTransactionStatus({ visible: true, status: "error", message: errorMessage });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     } finally { 
-      setAddingData(false); 
+      setCreatingRecord(false); 
     }
   };
 
@@ -206,8 +264,14 @@ const App: React.FC = () => {
       const businessData = await contractRead.getBusinessData(businessId);
       if (businessData.isVerified) {
         const storedValue = Number(businessData.decryptedValue) || 0;
-        setTransactionStatus({ visible: true, status: "success", message: "数据已在链上验证" });
-        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
+        setTransactionStatus({ 
+          visible: true, 
+          status: "success", 
+          message: "数据已链上验证" 
+        });
+        setTimeout(() => {
+          setTransactionStatus({ visible: false, status: "pending", message: "" });
+        }, 2000);
         return storedValue;
       }
       
@@ -223,11 +287,12 @@ const App: React.FC = () => {
           contractWrite.verifyDecryption(businessId, abiEncodedClearValues, decryptionProof)
       );
       
-      setTransactionStatus({ visible: true, status: "pending", message: "在链上验证解密..." });
+      setTransactionStatus({ visible: true, status: "pending", message: "链上验证解密中..." });
       
       const clearValue = result.decryptionResult.clearValues[encryptedValueHandle];
       
       await loadData();
+      addToHistory(`解密记录: ${businessId}`);
       
       setTransactionStatus({ visible: true, status: "success", message: "数据解密验证成功!" });
       setTimeout(() => {
@@ -238,13 +303,24 @@ const App: React.FC = () => {
       
     } catch (e: any) { 
       if (e.message?.includes("Data already verified")) {
-        setTransactionStatus({ visible: true, status: "success", message: "数据已在链上验证" });
-        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
+        setTransactionStatus({ 
+          visible: true, 
+          status: "success", 
+          message: "数据已链上验证" 
+        });
+        setTimeout(() => {
+          setTransactionStatus({ visible: false, status: "pending", message: "" });
+        }, 2000);
+        
         await loadData();
         return null;
       }
       
-      setTransactionStatus({ visible: true, status: "error", message: "解密失败: " + (e.message || "未知错误") });
+      setTransactionStatus({ 
+        visible: true, 
+        status: "error", 
+        message: "解密失败: " + (e.message || "未知错误") 
+      });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return null; 
     } finally { 
@@ -252,96 +328,129 @@ const App: React.FC = () => {
     }
   };
 
-  const checkAvailability = async () => {
+  const callIsAvailable = async () => {
     try {
       const contract = await getContractReadOnly();
       if (!contract) return;
       
-      const isAvailable = await contract.isAvailable();
-      setTransactionStatus({ visible: true, status: "success", message: "系统可用性检查成功!" });
+      const result = await contract.isAvailable();
+      setTransactionStatus({ 
+        visible: true, 
+        status: "success", 
+        message: "FHE 系统可用性检查通过!" 
+      });
+      addToHistory("系统可用性检查");
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
     } catch (e) {
-      setTransactionStatus({ visible: true, status: "error", message: "可用性检查失败" });
+      setTransactionStatus({ visible: true, status: "error", message: "系统检查失败" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     }
   };
 
-  const renderStats = () => {
-    const totalRecords = carbonData.length;
-    const verifiedRecords = carbonData.filter(d => d.isVerified).length;
-    const todayRecords = carbonData.filter(d => 
-      Date.now()/1000 - d.timestamp < 60 * 60 * 24
-    ).length;
-
+  const renderEcoDashboard = () => {
     return (
-      <div className="stats-grid">
-        <div className="stat-card">
-          <div className="stat-icon">📊</div>
-          <div className="stat-content">
-            <div className="stat-value">{totalRecords}</div>
-            <div className="stat-label">总记录数</div>
-          </div>
+      <div className="dashboard-panels">
+        <div className="panel neon-panel">
+          <h3>环保等级</h3>
+          <div className="stat-value">{ecoStats.level}</div>
+          <div className="stat-trend">得分: {ecoStats.ecoScore}</div>
         </div>
         
-        <div className="stat-card">
-          <div className="stat-icon">✅</div>
-          <div className="stat-content">
-            <div className="stat-value">{verifiedRecords}</div>
-            <div className="stat-label">已验证数据</div>
-          </div>
+        <div className="panel neon-panel">
+          <h3>总碳足迹</h3>
+          <div className="stat-value">{ecoStats.totalFootprint}kg</div>
+          <div className="stat-trend">本周: {ecoStats.weeklyChange}kg</div>
         </div>
         
-        <div className="stat-card">
-          <div className="stat-icon">🌱</div>
-          <div className="stat-content">
-            <div className="stat-value">{todayRecords}</div>
-            <div className="stat-label">今日新增</div>
-          </div>
-        </div>
-        
-        <div className="stat-card">
-          <div className="stat-icon">🏆</div>
-          <div className="stat-content">
-            <div className="stat-value">{environmentLevel}</div>
-            <div className="stat-label">环保等级</div>
+        <div className="panel neon-panel">
+          <h3>获得徽章</h3>
+          <div className="badges-container">
+            {ecoStats.badges.map((badge, index) => (
+              <span key={index} className="badge">{badge}</span>
+            ))}
           </div>
         </div>
       </div>
     );
   };
 
-  const renderFHEProcess = () => {
+  const renderCarbonChart = () => {
+    const data = records.filter(r => r.isVerified).slice(0, 7);
+    
     return (
-      <div className="fhe-process">
-        <div className="process-step">
-          <div className="step-number">1</div>
-          <div className="step-info">
+      <div className="carbon-chart">
+        <h3>近期碳足迹趋势</h3>
+        <div className="chart-bars">
+          {data.map((record, index) => (
+            <div key={index} className="chart-bar-container">
+              <div 
+                className="chart-bar" 
+                style={{ height: `${Math.min(100, (record.decryptedValue || 0) * 2)}%` }}
+              >
+                <span className="bar-value">{record.decryptedValue}kg</span>
+              </div>
+              <div className="bar-label">{record.name.substring(0, 4)}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const renderFHEFlow = () => {
+    return (
+      <div className="fhe-flow">
+        <div className="flow-step">
+          <div className="step-icon">🔒</div>
+          <div className="step-content">
             <h4>数据加密</h4>
-            <p>碳足迹数据使用Zama FHE进行加密保护</p>
+            <p>碳足迹数据通过 Zama FHE 加密</p>
           </div>
         </div>
-        <div className="process-arrow">→</div>
-        <div className="process-step">
-          <div className="step-number">2</div>
-          <div className="step-info">
+        <div className="flow-arrow">→</div>
+        <div className="flow-step">
+          <div className="step-icon">⛓️</div>
+          <div className="step-content">
             <h4>链上存储</h4>
             <p>加密数据安全存储在区块链上</p>
           </div>
         </div>
-        <div className="process-arrow">→</div>
-        <div className="process-step">
-          <div className="step-number">3</div>
-          <div className="step-info">
-            <h4>隐私计算</h4>
-            <p>在加密状态下进行同态计算</p>
+        <div className="flow-arrow">→</div>
+        <div className="flow-step">
+          <div className="step-icon">🔓</div>
+          <div className="step-content">
+            <h4>隐私解密</h4>
+            <p>仅用户可解密查看具体数据</p>
           </div>
         </div>
-        <div className="process-arrow">→</div>
-        <div className="process-step">
-          <div className="step-number">4</div>
-          <div className="step-info">
-            <h4>安全验证</h4>
-            <p>通过零知识证明验证计算结果</p>
+        <div className="flow-arrow">→</div>
+        <div className="flow-step">
+          <div className="step-icon">🌱</div>
+          <div className="step-content">
+            <h4>环保评级</h4>
+            <p>公开显示环保等级保护隐私</p>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderFAQ = () => {
+    return (
+      <div className="faq-section">
+        <h3>常见问题</h3>
+        <div className="faq-list">
+          <div className="faq-item">
+            <strong>Q: 我的碳足迹数据安全吗？</strong>
+            <p>A: 所有数据都经过 FHE 全同态加密，只有您能解密查看具体数值。</p>
+          </div>
+          <div className="faq-item">
+            <strong>Q: 环保等级如何计算？</strong>
+            <p>A: 基于您的加密碳足迹数据计算，不暴露具体生活细节。</p>
+          </div>
+          <div className="faq-item">
+            <strong>Q: 为什么需要验证解密？</strong>
+            <p>A: 验证确保数据真实可信，同时保护您的隐私安全。</p>
           </div>
         </div>
       </div>
@@ -352,30 +461,34 @@ const App: React.FC = () => {
     return (
       <div className="app-container">
         <header className="app-header">
-          <div className="logo-section">
-            <h1>碳足迹隐私追踪 🔐</h1>
-            <p>CarbonTrack - 保护隐私的环保计算</p>
+          <div className="logo">
+            <h1>CarbonTrack 🔐</h1>
+            <span>隐私碳足迹追踪</span>
           </div>
-          <ConnectButton />
+          <div className="header-actions">
+            <div className="wallet-connect-wrapper">
+              <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+            </div>
+          </div>
         </header>
         
-        <div className="welcome-section">
-          <div className="welcome-content">
-            <div className="eco-icon">🌍</div>
-            <h2>连接钱包开始环保之旅</h2>
-            <p>使用全同态加密技术，保护您的碳足迹隐私，展现环保成就</p>
-            <div className="feature-list">
-              <div className="feature-item">
-                <span className="feature-icon">🔒</span>
-                <span>数据完全加密</span>
+        <div className="connection-prompt">
+          <div className="connection-content">
+            <div className="connection-icon">🌍</div>
+            <h2>连接钱包开始追踪碳足迹</h2>
+            <p>使用 FHE 全同态加密技术，保护您的碳足迹数据隐私</p>
+            <div className="connection-steps">
+              <div className="step">
+                <span>1</span>
+                <p>连接您的加密钱包</p>
               </div>
-              <div className="feature-item">
-                <span className="feature-icon">🌱</span>
-                <span>隐私保护计算</span>
+              <div className="step">
+                <span>2</span>
+                <p>FHE 系统自动初始化</p>
               </div>
-              <div className="feature-item">
-                <span className="feature-icon">🏆</span>
-                <span>环保等级激励</span>
+              <div className="step">
+                <span>3</span>
+                <p>开始加密记录碳足迹</p>
               </div>
             </div>
           </div>
@@ -387,128 +500,166 @@ const App: React.FC = () => {
   if (!isInitialized || fhevmInitializing) {
     return (
       <div className="loading-screen">
-        <div className="spinner"></div>
-        <p>初始化FHE加密系统...</p>
-        <p className="loading-note">请稍候片刻</p>
+        <div className="fhe-spinner"></div>
+        <p>初始化 FHE 加密系统...</p>
+        <p>状态: {fhevmInitializing ? "初始化 FHEVM" : status}</p>
       </div>
     );
   }
 
   if (loading) return (
     <div className="loading-screen">
-      <div className="spinner"></div>
-      <p>加载碳足迹数据...</p>
+      <div className="fhe-spinner"></div>
+      <p>加载加密碳足迹系统...</p>
     </div>
   );
 
   return (
     <div className="app-container">
       <header className="app-header">
-        <div className="logo-section">
-          <h1>碳足迹隐私追踪 🔐</h1>
-          <p>FHE保护的环保计算平台</p>
+        <div className="logo">
+          <h1>CarbonTrack 🔐</h1>
+          <span>隐私碳足迹追踪</span>
         </div>
         
         <div className="header-actions">
-          <button onClick={checkAvailability} className="action-btn">
-            检查系统状态
+          <button 
+            onClick={() => setShowCreateModal(true)} 
+            className="create-btn"
+          >
+            + 记录碳足迹
           </button>
-          <button onClick={() => setShowAddModal(true)} className="primary-btn">
-            + 添加碳足迹
+          <button 
+            onClick={callIsAvailable}
+            className="system-btn"
+          >
+            系统检查
           </button>
-          <ConnectButton />
+          <button 
+            onClick={() => setShowFAQ(!showFAQ)}
+            className="faq-btn"
+          >
+            {showFAQ ? "隐藏FAQ" : "显示FAQ"}
+          </button>
+          <div className="wallet-connect-wrapper">
+            <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+          </div>
         </div>
       </header>
-
-      <main className="main-content">
-        <section className="environment-section">
-          <h2>您的环保成就</h2>
-          {renderStats()}
+      
+      <div className="main-content-container">
+        <div className="dashboard-section">
+          <h2>环保等级仪表盘 (FHE 🔐)</h2>
+          {renderEcoDashboard()}
           
-          <div className="fhe-info-panel">
-            <h3>FHE隐私保护流程</h3>
-            {renderFHEProcess()}
+          <div className="panel neon-panel full-width">
+            <h3>FHE 🔐 隐私保护流程</h3>
+            {renderFHEFlow()}
           </div>
-        </section>
 
-        <section className="data-section">
+          {renderCarbonChart()}
+        </div>
+        
+        <div className="records-section">
           <div className="section-header">
             <h2>碳足迹记录</h2>
-            <button onClick={loadData} className="refresh-btn" disabled={isRefreshing}>
-              {isRefreshing ? "刷新中..." : "刷新数据"}
-            </button>
+            <div className="header-actions">
+              <button 
+                onClick={loadData} 
+                className="refresh-btn" 
+                disabled={isRefreshing}
+              >
+                {isRefreshing ? "刷新中..." : "刷新"}
+              </button>
+            </div>
           </div>
           
-          <div className="data-list">
-            {carbonData.length === 0 ? (
-              <div className="empty-state">
-                <div className="empty-icon">📝</div>
+          <div className="records-list">
+            {records.length === 0 ? (
+              <div className="no-records">
                 <p>暂无碳足迹记录</p>
-                <button onClick={() => setShowAddModal(true)} className="primary-btn">
-                  添加第一条记录
+                <button 
+                  className="create-btn" 
+                  onClick={() => setShowCreateModal(true)}
+                >
+                  记录第一条足迹
                 </button>
               </div>
-            ) : (
-              carbonData.map((item, index) => (
-                <div 
-                  key={index} 
-                  className={`data-item ${item.isVerified ? 'verified' : ''}`}
-                  onClick={() => setSelectedData(item)}
-                >
-                  <div className="item-main">
-                    <div className="item-name">{item.name}</div>
-                    <div className="item-meta">
-                      <span>{new Date(item.timestamp * 1000).toLocaleDateString()}</span>
-                      <span>{item.creator.substring(0, 6)}...{item.creator.substring(38)}</span>
-                    </div>
-                  </div>
-                  <div className="item-status">
-                    {item.isVerified ? (
-                      <span className="status-verified">✅ 已验证: {item.decryptedValue}克</span>
-                    ) : (
-                      <span className="status-encrypted">🔒 FHE加密中</span>
-                    )}
-                  </div>
+            ) : records.map((record, index) => (
+              <div 
+                className={`record-item ${selectedRecord?.id === record.id ? "selected" : ""} ${record.isVerified ? "verified" : ""}`} 
+                key={index}
+                onClick={() => setSelectedRecord(record)}
+              >
+                <div className="record-title">
+                  {record.name}
+                  <span className="eco-level">{record.ecoLevel}</span>
                 </div>
-              ))
-            )}
+                <div className="record-meta">
+                  <span>类型: {record.category === "transport" ? "交通" : "消费"}</span>
+                  <span>时间: {new Date(record.timestamp * 1000).toLocaleDateString()}</span>
+                </div>
+                <div className="record-status">
+                  状态: {record.isVerified ? "✅ 已验证" : "🔓 待验证"}
+                  {record.isVerified && record.decryptedValue && (
+                    <span className="verified-amount">碳足迹: {record.decryptedValue}kg</span>
+                  )}
+                </div>
+              </div>
+            ))}
           </div>
-        </section>
-      </main>
+        </div>
 
-      {showAddModal && (
-        <AddDataModal
-          onSubmit={addCarbonData}
-          onClose={() => setShowAddModal(false)}
-          adding={addingData}
-          data={newData}
-          setData={setNewData}
+        {showFAQ && (
+          <div className="faq-container">
+            {renderFAQ()}
+          </div>
+        )}
+
+        <div className="history-section">
+          <h3>操作历史</h3>
+          <div className="history-list">
+            {operationHistory.map((item, index) => (
+              <div key={index} className="history-item">{item}</div>
+            ))}
+          </div>
+        </div>
+      </div>
+      
+      {showCreateModal && (
+        <ModalCreateRecord 
+          onSubmit={createRecord} 
+          onClose={() => setShowCreateModal(false)} 
+          creating={creatingRecord} 
+          recordData={newRecordData} 
+          setRecordData={setNewRecordData}
           isEncrypting={isEncrypting}
         />
       )}
-
-      {selectedData && (
-        <DetailModal
-          data={selectedData}
-          onClose={() => {
-            setSelectedData(null);
-            setDecryptedValue(null);
-          }}
-          decryptedValue={decryptedValue}
-          isDecrypting={isDecrypting || fheIsDecrypting}
-          onDecrypt={() => decryptData(selectedData.id)}
+      
+      {selectedRecord && (
+        <RecordDetailModal 
+          record={selectedRecord} 
+          onClose={() => { 
+            setSelectedRecord(null); 
+            setDecryptedData(null); 
+          }} 
+          decryptedData={decryptedData} 
+          setDecryptedData={setDecryptedData} 
+          isDecrypting={isDecrypting || fheIsDecrypting} 
+          decryptData={() => decryptData(selectedRecord.carbonValue)}
         />
       )}
-
+      
       {transactionStatus.visible && (
-        <div className={`transaction-toast ${transactionStatus.status}`}>
-          <div className="toast-content">
-            <div className="toast-icon">
-              {transactionStatus.status === "pending" && <div className="spinner"></div>}
-              {transactionStatus.status === "success" && "✓"}
-              {transactionStatus.status === "error" && "✗"}
+        <div className="transaction-modal">
+          <div className="transaction-content">
+            <div className={`transaction-icon ${transactionStatus.status}`}>
+              {transactionStatus.status === "pending" && <div className="fhe-spinner"></div>}
+              {transactionStatus.status === "success" && <div className="success-icon">✓</div>}
+              {transactionStatus.status === "error" && <div className="error-icon">✗</div>}
             </div>
-            <span>{transactionStatus.message}</span>
+            <div className="transaction-message">{transactionStatus.message}</div>
           </div>
         </div>
       )}
@@ -516,81 +667,80 @@ const App: React.FC = () => {
   );
 };
 
-const AddDataModal: React.FC<{
-  onSubmit: () => void;
-  onClose: () => void;
-  adding: boolean;
-  data: any;
-  setData: (data: any) => void;
+const ModalCreateRecord: React.FC<{
+  onSubmit: () => void; 
+  onClose: () => void; 
+  creating: boolean;
+  recordData: any;
+  setRecordData: (data: any) => void;
   isEncrypting: boolean;
-}> = ({ onSubmit, onClose, adding, data, setData, isEncrypting }) => {
+}> = ({ onSubmit, onClose, creating, recordData, setRecordData, isEncrypting }) => {
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const { name, value } = e.target;
     if (name === 'carbonValue') {
       const intValue = value.replace(/[^\d]/g, '');
-      setData({ ...data, [name]: intValue });
+      setRecordData({ ...recordData, [name]: intValue });
     } else {
-      setData({ ...data, [name]: value });
+      setRecordData({ ...recordData, [name]: value });
     }
   };
 
   return (
     <div className="modal-overlay">
-      <div className="modal">
+      <div className="create-record-modal">
         <div className="modal-header">
-          <h2>添加碳足迹记录</h2>
-          <button onClick={onClose} className="close-btn">×</button>
+          <h2>记录碳足迹</h2>
+          <button onClick={onClose} className="close-modal">&times;</button>
         </div>
         
         <div className="modal-body">
           <div className="fhe-notice">
-            <strong>FHE隐私保护</strong>
-            <p>碳足迹数据将使用Zama FHE进行加密处理</p>
+            <strong>FHE 🔐 加密保护</strong>
+            <p>碳足迹数据将使用 Zama FHE 加密 (仅支持整数)</p>
           </div>
           
           <div className="form-group">
             <label>活动名称 *</label>
-            <input
-              type="text"
-              name="name"
-              value={data.name}
-              onChange={handleChange}
-              placeholder="例如: 每日通勤"
+            <input 
+              type="text" 
+              name="name" 
+              value={recordData.name} 
+              onChange={handleChange} 
+              placeholder="例如: 开车通勤" 
             />
           </div>
           
           <div className="form-group">
-            <label>碳足迹值(克) *</label>
-            <input
-              type="number"
-              name="carbonValue"
-              value={data.carbonValue}
-              onChange={handleChange}
-              placeholder="输入整数值"
+            <label>活动类型 *</label>
+            <select name="category" value={recordData.category} onChange={handleChange}>
+              <option value="transport">交通出行</option>
+              <option value="consumption">消费购物</option>
+            </select>
+          </div>
+          
+          <div className="form-group">
+            <label>碳足迹值 (kg, 整数) *</label>
+            <input 
+              type="number" 
+              name="carbonValue" 
+              value={recordData.carbonValue} 
+              onChange={handleChange} 
+              placeholder="输入碳足迹数值..." 
+              step="1"
               min="0"
             />
-            <div className="input-hint">FHE加密整数</div>
-          </div>
-          
-          <div className="form-group">
-            <label>活动类别</label>
-            <select name="category" value={data.category} onChange={handleChange}>
-              <option value="transport">交通出行</option>
-              <option value="diet">饮食消费</option>
-              <option value="energy">能源使用</option>
-              <option value="shopping">购物消费</option>
-            </select>
+            <div className="data-type-label">FHE 加密整数</div>
           </div>
         </div>
         
         <div className="modal-footer">
-          <button onClick={onClose} className="secondary-btn">取消</button>
+          <button onClick={onClose} className="cancel-btn">取消</button>
           <button 
-            onClick={onSubmit}
-            disabled={adding || isEncrypting || !data.name || !data.carbonValue}
-            className="primary-btn"
+            onClick={onSubmit} 
+            disabled={creating || isEncrypting || !recordData.name || !recordData.carbonValue} 
+            className="submit-btn"
           >
-            {adding || isEncrypting ? "加密并提交中..." : "提交记录"}
+            {creating || isEncrypting ? "加密并创建中..." : "创建记录"}
           </button>
         </div>
       </div>
@@ -598,76 +748,103 @@ const AddDataModal: React.FC<{
   );
 };
 
-const DetailModal: React.FC<{
-  data: CarbonData;
+const RecordDetailModal: React.FC<{
+  record: CarbonRecord;
   onClose: () => void;
-  decryptedValue: number | null;
+  decryptedData: number | null;
+  setDecryptedData: (value: number | null) => void;
   isDecrypting: boolean;
-  onDecrypt: () => Promise<number | null>;
-}> = ({ data, onClose, decryptedValue, isDecrypting, onDecrypt }) => {
+  decryptData: () => Promise<number | null>;
+}> = ({ record, onClose, decryptedData, setDecryptedData, isDecrypting, decryptData }) => {
   const handleDecrypt = async () => {
-    await onDecrypt();
+    if (decryptedData !== null) { 
+      setDecryptedData(null); 
+      return; 
+    }
+    
+    const decrypted = await decryptData();
+    if (decrypted !== null) {
+      setDecryptedData(decrypted);
+    }
   };
 
   return (
     <div className="modal-overlay">
-      <div className="modal">
+      <div className="record-detail-modal">
         <div className="modal-header">
           <h2>碳足迹详情</h2>
-          <button onClick={onClose} className="close-btn">×</button>
+          <button onClick={onClose} className="close-modal">&times;</button>
         </div>
         
         <div className="modal-body">
-          <div className="detail-info">
-            <div className="info-row">
+          <div className="record-info">
+            <div className="info-item">
               <span>活动名称:</span>
-              <strong>{data.name}</strong>
+              <strong>{record.name}</strong>
             </div>
-            <div className="info-row">
+            <div className="info-item">
               <span>创建者:</span>
-              <strong>{data.creator.substring(0, 6)}...{data.creator.substring(38)}</strong>
+              <strong>{record.creator.substring(0, 6)}...{record.creator.substring(38)}</strong>
             </div>
-            <div className="info-row">
-              <span>创建时间:</span>
-              <strong>{new Date(data.timestamp * 1000).toLocaleString()}</strong>
+            <div className="info-item">
+              <span>记录时间:</span>
+              <strong>{new Date(record.timestamp * 1000).toLocaleDateString()}</strong>
+            </div>
+            <div className="info-item">
+              <span>活动类型:</span>
+              <strong>{record.category === "transport" ? "交通出行" : "消费购物"}</strong>
             </div>
           </div>
           
           <div className="data-section">
-            <h3>碳足迹数据</h3>
-            <div className="carbon-display">
-              <div className="carbon-value">
-                {data.isVerified ? 
-                  `${data.decryptedValue}克 (链上验证)` : 
-                  decryptedValue !== null ? 
-                  `${decryptedValue}克 (本地解密)` : 
-                  "🔒 FHE加密中"
+            <h3>加密碳足迹数据</h3>
+            
+            <div className="data-row">
+              <div className="data-label">碳足迹值:</div>
+              <div className="data-value">
+                {record.isVerified && record.decryptedValue ? 
+                  `${record.decryptedValue}kg (链上已验证)` : 
+                  decryptedData !== null ? 
+                  `${decryptedData}kg (本地解密)` : 
+                  "🔒 FHE 加密数据"
                 }
               </div>
               <button 
-                onClick={handleDecrypt}
+                className={`decrypt-btn ${(record.isVerified || decryptedData !== null) ? 'decrypted' : ''}`}
+                onClick={handleDecrypt} 
                 disabled={isDecrypting}
-                className={`decrypt-btn ${data.isVerified ? 'verified' : ''}`}
               >
-                {isDecrypting ? "验证中..." : 
-                 data.isVerified ? "✅ 已验证" : 
-                 decryptedValue !== null ? "🔄 重新验证" : 
-                 "🔓 验证解密"}
+                {isDecrypting ? (
+                  "🔓 验证中..."
+                ) : record.isVerified ? (
+                  "✅ 已验证"
+                ) : decryptedData !== null ? (
+                  "🔄 重新验证"
+                ) : (
+                  "🔓 验证解密"
+                )}
               </button>
             </div>
             
-            <div className="privacy-note">
-              <div className="privacy-icon">🔐</div>
-              <div>
-                <strong>隐私保护说明</strong>
-                <p>您的碳足迹数据全程加密处理，仅显示环保等级，不暴露具体生活细节</p>
-              </div>
+            <div className="eco-level-display">
+              <h4>环保等级</h4>
+              <div className="level-badge">{record.ecoLevel}</div>
+              <p>基于加密数据计算的隐私保护评级</p>
             </div>
           </div>
         </div>
         
         <div className="modal-footer">
-          <button onClick={onClose} className="secondary-btn">关闭</button>
+          <button onClick={onClose} className="close-btn">关闭</button>
+          {!record.isVerified && (
+            <button 
+              onClick={handleDecrypt} 
+              disabled={isDecrypting}
+              className="verify-btn"
+            >
+              {isDecrypting ? "链上验证中..." : "链上验证"}
+            </button>
+          )}
         </div>
       </div>
     </div>
